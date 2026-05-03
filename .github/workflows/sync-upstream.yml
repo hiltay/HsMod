@@ -1,0 +1,149 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # 每 6 小时检测一次上游更新
+  workflow_dispatch:      # 也支持在 Actions 页面手动触发
+
+permissions:
+  contents: write   # 需要 push 合并后的代码
+  actions: write    # 需要用 gh 显式触发 build workflow
+
+concurrency:
+  group: sync-upstream-bepinex5
+  cancel-in-progress: false
+
+env:
+  # 这些文件始终保留本 fork 的版本，上游同名文件不会覆盖它们。
+  # 在 mirror 模式（上游清理历史）下，会先备份再恢复这些文件。
+  # 每行一个路径，相对仓库根目录。
+  FORK_ONLY_FILES: |
+    .github/workflows/sync-upstream.yml
+    .github/workflows/build-windows.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bepinex5
+        uses: actions/checkout@v4
+        with:
+          ref: bepinex5
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream (Pik-4/HsMod)
+        run: |
+          git remote add upstream https://github.com/Pik-4/HsMod.git
+          git fetch upstream bepinex5 --tags --prune
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          set -eo pipefail
+
+          LOCAL_HASH=$(git rev-parse HEAD)
+          UPSTREAM_HASH=$(git rev-parse upstream/bepinex5)
+          echo "本地 HEAD : $LOCAL_HASH"
+          echo "上游 HEAD : $UPSTREAM_HASH"
+
+          if [ "$LOCAL_HASH" = "$UPSTREAM_HASH" ]; then
+            echo "代码已是最新，无需同步。"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # mirror 模式：丢弃本地历史 -> 硬重置到上游 -> 还原 fork-only 文件 -> force push
+          # 适用场景：上游清理了历史导致没有公共祖先，或常规 merge 出现冲突。
+          mirror_sync() {
+            echo "=== 进入 mirror 同步模式（将 force-push 到 origin/bepinex5）==="
+            local backup_dir
+            backup_dir=$(mktemp -d)
+            echo "备份 fork-only 文件到 $backup_dir"
+            while IFS= read -r f; do
+              f=$(echo "$f" | xargs)   # 去掉前后空白
+              [ -z "$f" ] && continue
+              if [ -f "$f" ]; then
+                mkdir -p "$backup_dir/$(dirname "$f")"
+                cp "$f" "$backup_dir/$f"
+                echo "  backup : $f"
+              else
+                echo "  skip   : $f（本地不存在）"
+              fi
+            done <<< "$FORK_ONLY_FILES"
+
+            echo "硬重置到 upstream/bepinex5"
+            git reset --hard upstream/bepinex5
+
+            echo "恢复 fork-only 文件"
+            while IFS= read -r f; do
+              f=$(echo "$f" | xargs)
+              [ -z "$f" ] && continue
+              if [ -f "$backup_dir/$f" ]; then
+                mkdir -p "$(dirname "$f")"
+                cp "$backup_dir/$f" "$f"
+                git add -- "$f"
+                echo "  restore: $f"
+              fi
+            done <<< "$FORK_ONLY_FILES"
+
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(sync): restore fork-only files after upstream mirror"
+            else
+              echo "fork-only 文件无变化，无需额外 commit。"
+            fi
+
+            git push --force-with-lease origin bepinex5
+            echo "mirror 同步完成。"
+          }
+
+          # 1) 没有公共祖先（上游清理了历史）：直接 mirror
+          if ! git merge-base HEAD upstream/bepinex5 >/dev/null 2>&1; then
+            echo "本地与上游没有公共祖先（上游可能清理过历史），走 mirror 模式。"
+            mirror_sync
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2) 本地是上游的祖先：fast-forward
+          if git merge-base --is-ancestor HEAD upstream/bepinex5; then
+            echo "本地是上游祖先，执行 fast-forward。"
+            git merge --ff-only upstream/bepinex5
+            git push origin bepinex5
+            echo "fast-forward 同步完成。"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3) 存在分叉：尝试常规 merge，失败则降级到 mirror
+          echo "存在分叉，尝试 no-ff merge。"
+          if git merge --no-edit --no-ff upstream/bepinex5 \
+               -m "chore(sync): merge upstream Pik-4/HsMod@bepinex5"; then
+            git push origin bepinex5
+            echo "merge 同步完成。"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::merge 出现冲突，回退到 mirror 模式。"
+          git merge --abort || true
+          mirror_sync
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger build-windows workflow
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # 由 GITHUB_TOKEN push 出的 commit 不会自动触发其他 workflow，
+          # 必须显式调用 workflow_dispatch 来启动编译流水线。
+          # 必须用 --repo 指定当前仓库，否则 gh 会把 upstream remote 当成目标而 404。
+          gh workflow run build-windows.yml --ref bepinex5 --repo "${{ github.repository }}"
+          echo "已触发 build-windows.yml (仓库: ${{ github.repository }}, 分支: bepinex5)"

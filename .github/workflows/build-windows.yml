@@ -1,0 +1,33 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches: [ "master", "main", "bepinex5" ]
+  pull_request:
+  workflow_dispatch: # 允许在 Actions 页面手动点击按钮触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Patch .csproj to use Windows Libraries
+      # 替换项目文件中的 Linux 库路径 (UnstrippedCorlibUinx) 为 Windows 库路径 (UnstrippedCorlib)
+      run: |
+        (Get-Content HsMod/HsMod.csproj) -replace 'UnstrippedCorlibUinx', 'UnstrippedCorlib' | Set-Content HsMod/HsMod.csproj
+      shell: powershell
+
+    - name: Build Solution
+      run: msbuild HsMod.sln /p:Configuration=Release /p:Platform="Any CPU"
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: HsMod-Windows
+        path: HsMod/Release/HsMod.dll
